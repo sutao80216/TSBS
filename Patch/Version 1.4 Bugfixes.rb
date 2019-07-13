@@ -2,6 +2,11 @@
 # TSBS v1.4 Bugfixes
 #-------------------------------------------------------------------------------
 # Change Logs :
+# 2019.05.19 - Fixed crash, auto re-target from random targetting causing crash
+#              when the new target dies.
+# 2019.03.08 - Fixed crash if boomerang is used together with <area> tag and 
+#              one animation tag
+# 2018.07.15 - Fixed bug where random reflect didn't kill victim
 # 2015.05.01 - Fixed hide target in animation crash
 #            - Fixed accessing sprite when escape battle crash (detail below)
 # 2015.03.25 - Added patch to work with TSBS in game editor
@@ -19,6 +24,17 @@
 #-------------------------------------------------------------------------------
 # Known issues :
 #-------------------------------------------------------------------------------
+# - When using random target, the script auto target another battler if one of 
+#   the original target dies. And if the new target also dies, it did not get 
+#   registered the kill so the script recognize it as alive, this caused crash
+#   (FIXED!)
+#
+# - When a skill throws a projectile and combined with boomerang, area, and
+#   one animation tag, it throws a crash because of reference issuses (FIXED!)
+#
+# - When a projectile is reflected to friends unit, and it reaches zero didn't 
+#   kill it. If actor is the victim, it may crash. (FIXED!)
+#
 # - When you set an event in Troop that target all enemies (like change enemy 
 #   HP / MP, hidden enemies will be revealed, but can not be targeted) (FIXED!)
 #
@@ -410,6 +426,76 @@ class Sprite_BattlerIcon
 end
 
 #===============================================================================
+# ** Projectile Reflect Fix
+#===============================================================================
+
+class Sprite_Projectile
+  def repel
+    temp = subject
+    if random_reflect? # Random target reflect if skill/item allow to do so
+      temp = temp.friends_unit.alive_members.shuffle[0]
+      $game_temp.battler_targets << temp # <-- Add to refresh
+    end
+    self.subject = target
+    self.target = temp
+    # Invert setup as well ~
+    start = @setup[PROJ_START]
+    start_p = @setup[PROJ_STARTPOS]
+    @setup[PROJ_START] = @setup[PROJ_END]
+    @setup[PROJ_STARTPOS] = @setup[PROJ_ENDPOS]
+    @setup[PROJ_END] = start
+    @setup[PROJ_ENDPOS] = start_p
+    self.mirror = !self.mirror
+    # Re-start projectile
+    start_projectile
+    start_animation(@animation, !@mirror)
+    self.subject = temp if boomerang # Boomerang fix
+  end
+  
+  # Boomerang + Area tag fix
+  def start_projectile
+    subj = (@setup[PROJ_REVERSE] ? @target : @subject)
+    subj = @subject if @target.is_a?(Array)
+    ypos = 0
+    xpos = 0
+    if subj.is_a?(Array)
+      size = subj.size
+      xpos = subj.inject(0) {|r,battler| r + battler.screen_x}/size 
+      ypos = subj.inject(0) {|r,battler| r + battler.screen_y}/size 
+      xpos += @setup[PROJ_STARTPOS][0]
+    else
+      spr_subj = subj.sprite
+      case @setup[PROJ_START]
+      when PROJ_POSITION_HEAD; ypos = subj.y - spr_subj.height
+      when PROJ_POSITION_MID;  ypos = subj.y - spr_subj.height/2
+      when PROJ_POSITION_FEET; ypos = subj.y
+      when PROJ_POSITION_NONE; ypos = xpos = 0
+      else; ypos = subj.y;
+      end
+      xpos = subj.x + @setup[PROJ_STARTPOS][0]
+    end
+    ypos += @setup[PROJ_STARTPOS][1]
+    @angle = (self.mirror ? 360 - @setup[PROJ_ANGLE] : @setup[PROJ_ANGLE])
+    set_point(xpos, ypos)
+    @point.continue = @setup[PROJ_PIERCE]  
+    @afterimage_opac = @setup[PROJ_AFTOPAC]
+    @afterimage_rate = @setup[PROJ_AFTRATE]
+    @anim_top = @setup[PROJ_ANIMPOS]
+    if @setup[PROJ_ANIMSTART]
+      if @setup[PROJ_ANIMSTART] == PROJ_ANIMDEFAULT
+        anim = $data_animations[item.animation_id] 
+      else
+        anim = $data_animations[@setup[PROJ_ANIMSTART]]
+      end
+      @anim_start.start_animation(anim,subj.flip)
+    end
+    @anim_start.target_sprite = [subj.sprite] if @setup[PROJ_FLASH_REF][0]
+    apply_item(target, target.is_a?(Array)) if @setup[PROJ_DAMAGE_EXE] == -1
+    make_aim(@dur, @jump)
+  end
+end
+
+#===============================================================================
 # ** Spriteset_Battle
 #===============================================================================
 
@@ -459,6 +545,39 @@ class Scene_Battle
   def start
     lazy_fix_start
     $sprset = @spriteset
+  end
+  
+  #----------------------------------------------------------------------------
+  # Auto retarget fix
+  #----------------------------------------------------------------------------
+  def tsbs_action_main(targets, item, subj)
+    # Determine if item is not AoE ~
+    if !item.area?
+      subj.area_flag = false
+      # Repeat item sequence for target number times
+      targets.each do |target|
+        # Change target if the target is currently dead
+        if target.dead? && !item.for_dead_friend? 
+          target = subj.opponents_unit.random_target
+          break if target.nil?
+          $game_temp.battler_targets << target # <-- Adding this line
+          # Break if there is no target avalaible or force break action
+        end
+        target = @cover_battlers[target] if @cover_battlers[target]
+        # Do sequence
+        subj.target = target
+        subj.battle_phase = :skill
+        wait_for_skill_sequence
+        break if [:forced, :idle].include?(subj.battle_phase) || 
+          subj.break_action
+      end
+    # If item is area of effect damage. Do sequence skill only once
+    else
+      subj.area_flag = true
+      subj.battle_phase = :skill
+      wait_for_skill_sequence
+      subj.area_flag = false
+    end
   end
 end
 
